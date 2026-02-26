@@ -38,6 +38,7 @@ Soroban contract for revenue-share offerings and blacklist management.
 | `get_pending_issuer_transfer` | `token: Address` | `Option<Address>` | — | Get the proposed new issuer for a pending transfer, if any. |
 | `set_testnet_mode` | `enabled: bool` | `Result<(), RevoraError>` | admin | Enable or disable testnet mode. When enabled, certain validations are relaxed for testnet deployments. |
 | `is_testnet_mode` | — | `bool` | — | Return true if testnet mode is enabled. |
+| `get_version` | — | `u32` | — | Return the current contract version (#23). Used for upgrade compatibility. |
 
 ### Types
 
@@ -56,6 +57,8 @@ Soroban contract for revenue-share offerings and blacklist management.
 | 12 | `IssuerTransferPending` | A transfer is already pending for this offering. |
 | 13 | `NoTransferPending` | No transfer is pending for this offering (accept/cancel failed). |
 | 14 | `UnauthorizedTransferAccept` | Caller is not authorized to accept this transfer. |
+| 17 | `InvalidAmount` | Amount is invalid (e.g. negative, or zero for deposit) (#35). |
+| 18 | `InvalidPeriodId` | period_id is 0 where a positive value is required (#35). |
 
 Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`. Use `try_register_offering`, `try_report_revenue`, and similar `try_*` client methods to receive contract errors as `Result`.
 
@@ -85,6 +88,32 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 - **Rounding:** Use `compute_share(amount, revenue_share_bps, mode)` for consistent distribution math. Per-offering default is `get_rounding_mode(issuer, token)` (Truncation if unset). Sum of shares must not exceed total; both modes keep result in [0, amount].
 - **Issuer Transfer:** See [ISSUER_TRANSFER.md](./ISSUER_TRANSFER.md) for comprehensive documentation on securely transferring issuer control via the two-step propose/accept flow.
 - **Testnet mode:** Admin can enable testnet mode via `set_testnet_mode(true)` to relax certain validations for non-production deployments. When enabled: (1) `register_offering` allows `revenue_share_bps > 10000`, (2) `report_revenue` skips concentration enforcement. Use only for testnet/development environments. Check mode with `is_testnet_mode()`.
+
+### Contract version and migration (#23)
+
+- **Version:** Call `get_version()` to read the current contract version (a constant, e.g. `1`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
+- **Upgrade strategy:** This codebase deploys a single WASM contract; there is no in-place upgrade. Future upgrades are expected to:
+  1. Deploy a new contract (new WASM) with a higher `CONTRACT_VERSION`.
+  2. Optionally run a one-time migration (e.g. admin or migration script) that reads state from the old contract and writes into the new one, or that emits migration-milestone events for indexers.
+  3. Indexers and frontends should use `get_version()` to detect the deployed version and handle schema/API differences.
+- **Migration milestones:** When a new version is deployed, integrators can treat the first transaction that succeeds on the new contract as a migration milestone; the contract does not currently emit a dedicated "migration" event, but event schemas may include a version field (e.g. v1 events) for consumers.
+
+### Input parameter validation (#35)
+
+Accepted ranges and rejection semantics:
+
+| Parameter | Entrypoint(s) | Accepted range | Error if invalid |
+|-----------|----------------|----------------|------------------|
+| `revenue_share_bps` | `register_offering` | 0–10000 (testnet: any) | `InvalidRevenueShareBps` |
+| `share_bps` | `set_holder_share` | 0–10000 | `InvalidShareBps` |
+| `amount` | `report_revenue` | ≥ 0 | `InvalidAmount` |
+| `amount` | `deposit_revenue` | > 0 | `InvalidAmount` |
+| `period_id` | `deposit_revenue` | > 0 | `InvalidPeriodId` |
+| `period_id` | `report_revenue` | any u64 | — |
+| `min_amount` | `set_min_revenue_threshold` | ≥ 0 | `InvalidAmount` |
+| `fee_bps` | `set_platform_fee` | 0–5000 | `LimitReached` |
+
+Use `try_*` client methods to receive these errors as `Result`.
 
 ---
 
@@ -2240,6 +2269,155 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 cargo test
 ```
+
+
+## Multisig Admin Pattern
+
+### Overview
+
+The contract includes an optional multi-signature (multisig) pattern for critical administrative operations. When initialized, it replaces the single-admin model for sensitive actions such as freezing the contract and changing the admin address.
+
+### Multisig Methods
+
+| Method | Parameters | Returns | Auth | Description |
+|--------|------------|---------|------|-------------|
+| `init_multisig` | `caller: Address`, `owners: Vec<Address>`, `threshold: u32` | `Result<(), RevoraError>` | caller | Initialize multisig. Can only be called once. Disables `set_admin` and `freeze`. |
+| `propose_action` | `proposer: Address`, `action: ProposalAction` | `Result<u32, RevoraError>` | proposer (must be owner) | Create a new proposal. Proposer's vote is automatically counted. Returns proposal ID. |
+| `approve_action` | `approver: Address`, `proposal_id: u32` | `Result<(), RevoraError>` | approver (must be owner) | Approve an existing proposal. Duplicate approvals are silently ignored. |
+| `execute_action` | `proposal_id: u32` | `Result<(), RevoraError>` | — | Execute a proposal if threshold is met. Fails if already executed or threshold not met. |
+| `get_proposal` | `proposal_id: u32` | `Option<Proposal>` | — | Fetch a proposal by ID. |
+| `get_multisig_owners` | — | `Vec<Address>` | — | Get current owner list. |
+| `get_multisig_threshold` | — | `Option<u32>` | — | Get current approval threshold. |
+
+### Proposal Actions
+
+| Action | Effect |
+|--------|--------|
+| `SetAdmin(Address)` | Updates the contract admin address. |
+| `Freeze` | Freezes the contract (disables state-changing operations). |
+| `SetThreshold(u32)` | Updates the approval threshold. Must be ≤ current owner count. |
+| `AddOwner(Address)` | Adds a new owner to the multisig. |
+| `RemoveOwner(Address)` | Removes an owner. Fails if remaining owners < threshold. |
+
+### Events
+
+| Topic / name | Payload | When |
+|--------------|---------|------|
+| `prop_new` | `(proposer), proposal_id` | After `propose_action`. |
+| `prop_app` | `(approver), proposal_id` | After `approve_action` (and auto-approval on propose). |
+| `prop_exe` | `(proposal_id), true` | After `execute_action`. |
+
+### Soroban Compatibility and Limitations
+
+**Soroban does not support multi-party authorization in a single transaction.** Each owner must call `approve_action` in a separate transaction. This is a fundamental constraint of the Soroban execution model.
+
+Key design decisions and limitations:
+
+1. **Single-transaction init**: `init_multisig` only requires the caller (deployer) to authorize. Owners are registered without requiring their individual signatures at init time.
+
+2. **Auto-approval on propose**: The proposer's address is automatically counted as the first approval when `propose_action` is called. This reduces the number of separate transactions needed.
+
+3. **No time-lock**: Proposals can be executed immediately once the threshold is met. For production use, consider adding a time-lock delay between threshold-met and execution.
+
+4. **No proposal expiry**: Proposals do not expire. A stale proposal can be executed at any time once it reaches threshold. For production use, add an expiry timestamp to proposals.
+
+5. **No replay protection beyond executed flag**: Once executed, a proposal cannot be re-executed. However, a new identical proposal can be created.
+
+6. **Owner management via proposals**: Adding/removing owners and changing the threshold all require multisig approval, preventing unilateral changes.
+
+7. **Mutual exclusion with direct admin**: Once `init_multisig` is called, `set_admin` and `freeze` are disabled and return `LimitReached`. All admin operations must go through the proposal flow.
+
+### Production Recommendation
+
+This multisig pattern is **suitable for low-frequency admin operations** in a controlled environment. For high-security production deployments, consider:
+
+- Adding time-locks (e.g. 24–72 hour delay between threshold met and execution)
+- Adding proposal expiry (e.g. proposals expire after 7 days)
+- Off-chain coordination tooling (e.g. a multisig UI that tracks pending proposals)
+- A formal security audit of the threshold/owner management flows
+- Using a dedicated multisig contract (e.g. a Soroban port of Gnosis Safe) for maximum security
+
+---
+### Regression Testing Policy
+
+The contract includes a dedicated regression test suite to capture and prevent recurrence of critical bugs discovered in production, audits, or security reviews. All regression tests are located in `src/test.rs` under the `mod regression` section.
+
+#### When to Add a Regression Test
+
+Add a regression test when:
+- A critical bug is discovered in production or testnet deployments
+- An audit or security review identifies a vulnerability
+- A bug fix addresses incorrect behavior that could recur
+- An edge case causes unexpected contract behavior or panic
+- A fix prevents data corruption or loss of funds
+
+#### Naming Convention
+
+Use descriptive names that reference the issue:
+- Format: `regression_issue_N_brief_description`
+- Example: `regression_issue_48_overflow_in_share_calculation`
+- For audit findings: `regression_audit_2024_q1_section_3_2`
+
+#### Required Documentation Format
+
+Each regression test MUST include:
+
+```rust
+/// Regression Test: [Brief Title]
+///
+/// **Related Issue:** #N or [Audit Report Reference]
+///
+/// **Original Bug:**
+/// [Detailed description of what went wrong, including:
+///  - Conditions that triggered the bug
+///  - Incorrect behavior observed
+///  - Impact (panic, wrong calculation, security issue)]
+///
+/// **Expected Behavior:**
+/// [What should happen instead]
+///
+/// **Fix Applied:**
+/// [Brief description of the code change that resolved it]
+#[test]
+fn regression_issue_N_description() {
+    // Test implementation
+}
+```
+
+#### Determinism Requirements
+
+All regression tests MUST be deterministic and CI-safe:
+- Use `Env::default()` with `mock_all_auths()` for predictable auth
+- Use `Address::generate(&env)` for test addresses (deterministic within test)
+- Avoid `env.ledger().timestamp()` without explicit mocking
+- Use fixed seeds for any pseudo-random test data
+- No external network calls or file system dependencies
+
+#### Performance Expectations
+
+- Individual tests should complete in <100ms
+- Avoid unnecessary setup; use helper functions (`make_client()`, `setup()`)
+- Keep test scope focused on the specific bug being prevented
+- Use minimal data sets that reproduce the issue
+
+#### Coverage Requirement
+
+The overall test suite (including regression tests) MUST maintain minimum 95% code coverage. Run coverage checks with:
+
+```bash
+cargo tarpaulin --out Html --output-dir coverage
+```
+
+#### CI Integration
+
+Regression tests run automatically as part of `cargo test`:
+- No special flags or environment variables required
+- Tests must pass on all supported platforms (Linux, macOS, Windows)
+- Snapshot tests in `test_snapshots/` are validated automatically
+
+#### Example Regression Test
+
+See `src/test.rs::regression::regression_template_example` for a complete template demonstrating the required structure and documentation format.
 
 ### Contributor guidelines (reduce merge conflicts)
 
