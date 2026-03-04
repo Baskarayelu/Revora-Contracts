@@ -56,6 +56,8 @@ pub enum RevoraError {
     InvalidAmount = 21,
     /// period_id is invalid (e.g. zero when required to be positive) (#35).
     InvalidPeriodId = 22,
+    /// Deposit would exceed the offering's supply cap (#96).
+    SupplyCapExceeded = 23,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -143,6 +145,8 @@ const EVENT_METADATA_UPDATED: Symbol = symbol_short!("meta_upd");
 const EVENT_MIN_REV_THRESHOLD_SET: Symbol = symbol_short!("min_rev");
 /// Emitted when reported revenue is below the offering's minimum threshold; no distribution triggered (#25).
 const EVENT_REV_BELOW_THRESHOLD: Symbol = symbol_short!("rev_below");
+/// Emitted when an offering's supply cap is reached (#96).
+const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 /// Emitted when per-offering investment constraints are set or updated (#97).
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
@@ -330,6 +334,8 @@ pub enum DataKey {
     IssuerRegistered(Address),
     /// Total deposited revenue for an offering token (#39).
     DepositedRevenue(Address),
+    /// Per-offering supply cap (#96). 0 = no cap.
+    SupplyCap(Address, Address),
     /// Per-offering investment constraints: min and max stake per investor (#97).
     InvestmentConstraints(Address, Address),
 }
@@ -388,6 +394,18 @@ impl RevoraRevenueShare {
             return Err(RevoraError::PeriodAlreadyDeposited);
         }
 
+        // Supply cap check (#96): reject if deposit would exceed cap
+        let cap_key = DataKey::SupplyCap(issuer.clone(), token.clone());
+        let cap: i128 = env.storage().persistent().get(&cap_key).unwrap_or(0);
+        if cap > 0 {
+            let deposited_key = DataKey::DepositedRevenue(token.clone());
+            let deposited: i128 = env.storage().persistent().get(&deposited_key).unwrap_or(0);
+            let new_total = deposited.saturating_add(amount);
+            if new_total > cap {
+                return Err(RevoraError::SupplyCapExceeded);
+            }
+        }
+
         // Store or validate payment token for this offering
         let pt_key = DataKey::PaymentToken(token.clone());
         if let Some(existing_pt) = env.storage().persistent().get::<DataKey, Address>(&pt_key) {
@@ -417,11 +435,33 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&entry_key, &period_id);
         env.storage().persistent().set(&count_key, &(count + 1));
 
+        // Update cumulative deposited revenue and emit cap-reached event if applicable (#96)
+        let deposited_key = DataKey::DepositedRevenue(token.clone());
+        let deposited: i128 = env.storage().persistent().get(&deposited_key).unwrap_or(0);
+        let new_deposited = deposited.saturating_add(amount);
+        env.storage().persistent().set(&deposited_key, &new_deposited);
+
+        let cap_val: i128 = env.storage().persistent().get(&cap_key).unwrap_or(0);
+        if cap_val > 0 && new_deposited >= cap_val {
+            env.events().publish(
+                (EVENT_SUPPLY_CAP_REACHED, issuer.clone(), token.clone()),
+                (new_deposited, cap_val),
+            );
+        }
+
         env.events().publish(
             (EVENT_REV_DEPOSIT, issuer, token),
             (payment_token, amount, period_id),
         );
         Ok(())
+    }
+
+    /// Return the supply cap for an offering (0 = no cap). (#96)
+    pub fn get_supply_cap(env: Env, issuer: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupplyCap(issuer, token))
+            .unwrap_or(0)
     }
 
     /// Return true if the contract is in event-only mode.
@@ -596,12 +636,14 @@ impl RevoraRevenueShare {
     /// Returns `Err(RevoraError::InvalidRevenueShareBps)` if revenue_share_bps > 10000.
     /// In testnet mode, bps validation is skipped to allow flexible testing.
 
+    /// Register a new offering. `supply_cap`: max cumulative deposited revenue for this offering; 0 = no cap (#96).
     pub fn register_offering(
         env: Env,
         issuer: Address,
         token: Address,
         revenue_share_bps: u32,
         payout_asset: Address,
+        supply_cap: i128,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
@@ -631,6 +673,11 @@ impl RevoraRevenueShare {
             // Maintain reverse lookup: token -> issuer
             let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
             env.storage().persistent().set(&issuer_lookup_key, &issuer);
+
+            if supply_cap > 0 {
+                let cap_key = DataKey::SupplyCap(issuer.clone(), token.clone());
+                env.storage().persistent().set(&cap_key, &supply_cap);
+            }
         }
 
         // Track issuer in global registry for cross-offering aggregation (#39)
