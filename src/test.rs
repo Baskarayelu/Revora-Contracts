@@ -6089,7 +6089,7 @@ fn test_event_only_mode_register_and_report() {
     // Verify event emitted (skip checking EVENT_INIT)
     let events = env.events().all();
     let offer_reg_val = symbol_short!("offer_reg").into_val(&env);
-    assert!(events.iter().any(|e| e.1.contains(&offer_reg_val)));
+    assert!(events.iter().any(|e| e.1.contains(offer_reg_val)));
 
     // Storage should be empty for this offering
     assert!(client.get_offering(&issuer, &symbol_short!("def"), &token).is_none());
@@ -6109,8 +6109,8 @@ fn test_event_only_mode_register_and_report() {
     let events = env.events().all();
     let rev_init_val = symbol_short!("rev_init").into_val(&env);
     let rev_rep_val = symbol_short!("rev_rep").into_val(&env);
-    assert!(events.iter().any(|e| e.1.contains(&rev_init_val)));
-    assert!(events.iter().any(|e| e.1.contains(&rev_rep_val)));
+    assert!(events.iter().any(|e| e.1.contains(rev_init_val)));
+    assert!(events.iter().any(|e| e.1.contains(rev_rep_val)));
 
     // Audit summary should NOT be updated
     assert!(client.get_audit_summary(&issuer, &symbol_short!("def"), &token).is_none());
@@ -6137,7 +6137,7 @@ fn test_event_only_mode_blacklist() {
 
     let events = env.events().all();
     let bl_add_val = symbol_short!("bl_add").into_val(&env);
-    assert!(events.iter().any(|e| e.1.contains(&bl_add_val)));
+    assert!(events.iter().any(|e| e.1.contains(bl_add_val)));
 
     assert!(!client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
     assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 0);
@@ -6160,7 +6160,7 @@ fn test_event_only_mode_testnet_config() {
 
     let events = env.events().all();
     let test_mode_val = symbol_short!("test_mode").into_val(&env);
-    assert!(events.iter().any(|e| e.1.contains(&test_mode_val)));
+    assert!(events.iter().any(|e| e.1.contains(test_mode_val)));
 
     assert!(!client.is_testnet_mode());
 }
@@ -7295,7 +7295,7 @@ mod regression {
 
         match op {
             0 => {
-                client.try_register_offering(
+                let _ = client.try_register_offering(
                     &issuer,
                     &symbol_short!("def"),
                     &token,
@@ -7307,7 +7307,7 @@ mod regression {
             1 => {
                 let amount = (next_u64(seed) % 1_000_000 + 1) as i128;
                 let period_id = next_period(seed) % 1_000_000 + 1;
-                client.try_report_revenue(
+                let _ = client.try_report_revenue(
                     &issuer,
                     &symbol_short!("def"),
                     &token,
@@ -7318,7 +7318,7 @@ mod regression {
                 );
             }
             2 => {
-                client.try_set_concentration_limit(
+                let _ = client.try_set_concentration_limit(
                     &issuer,
                     &symbol_short!("def"),
                     &token,
@@ -7328,7 +7328,7 @@ mod regression {
             }
             3 => {
                 let conc_bps = (next_u64(seed) % 10_001) as u32;
-                client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &conc_bps);
+                let _ = client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &conc_bps);
             }
             4 => {
                 let holder = Address::generate(env);
@@ -7393,7 +7393,7 @@ mod regression {
         pay1.push_back(Address::generate(&env1));
         let mut seed1 = INVARIANT_SEED;
         for _ in 0..16 {
-            client1.try_register_offering(
+            let _ = client1.try_register_offering(
                 &iss1.get(0).unwrap(),
                 &symbol_short!("def"),
                 &tok1.get(0).unwrap(),
@@ -7416,7 +7416,7 @@ mod regression {
         pay2.push_back(Address::generate(&env2));
         let mut seed2 = INVARIANT_SEED;
         for _ in 0..16 {
-            client2.try_register_offering(
+            let _ = client2.try_register_offering(
                 &iss2.get(0).unwrap(),
                 &symbol_short!("def"),
                 &tok2.get(0).unwrap(),
