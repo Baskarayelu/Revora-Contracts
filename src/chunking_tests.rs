@@ -1,4 +1,3 @@
-#![cfg(test)]
 #![allow(dead_code, unused_variables, unused_imports)]
 
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
